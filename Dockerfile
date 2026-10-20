@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM node:24-bookworm-slim AS build
+FROM node:26-bookworm-slim AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 # Optional CA mount supports managed build proxies without baking their CA into images.
@@ -13,7 +13,7 @@ COPY scripts ./scripts
 RUN npm run verify
 RUN npm prune --omit=dev --ignore-scripts --offline --no-audit --no-fund
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 ENV NODE_ENV=production PORT=8080 DATABASE_PATH=/app/data/hq.db
 WORKDIR /app
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
