@@ -32,6 +32,9 @@ export function ampEnvironment(config: Config, source: NodeJS.ProcessEnv = proce
   for (const key of ['PATH', 'HOME', 'LANG', 'TMPDIR', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR']) {
     if (source[key]) env[key] = source[key];
   }
+  env.XDG_CONFIG_HOME = '/tmp/hq-amp/config';
+  env.XDG_CACHE_HOME = '/tmp/hq-amp/cache';
+  env.XDG_DATA_HOME = '/tmp/hq-amp/data';
   env.AMP_API_KEY = config.ampApiKey;
   return env;
 }
@@ -41,7 +44,7 @@ export class ProcessAmpAdapter implements AmpAdapter {
     return new Promise((resolve, reject) => {
       if (signal.aborted) { reject(new Error('Amp monitoring interrupted.')); return; }
       const workerUrl = new URL(import.meta.url.endsWith('.ts') ? './amp-worker.ts' : './amp-worker.js', import.meta.url);
-      const child = fork(workerUrl, [], { env: ampEnvironment(this.config), stdio: ['ignore', 'ignore', 'ignore', 'ipc'], detached: process.platform !== 'win32' });
+      const child = fork(workerUrl, [], { execArgv: import.meta.url.endsWith('.ts') ? process.execArgv : [], env: ampEnvironment(this.config), stdio: ['ignore', 'ignore', 'ignore', 'ipc'], detached: process.platform !== 'win32' });
       let settled = false;
       const stop = () => {
         try { if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGTERM'); else child.kill('SIGTERM'); } catch { /* already exited */ }
@@ -77,6 +80,7 @@ export class ProcessAmpAdapter implements AmpAdapter {
 export class AmpService {
   private active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private closing = false;
+  private retrievals = new Set<AbortController>();
   constructor(readonly store: Store, readonly config: Config, readonly adapter: AmpAdapter = new ProcessAmpAdapter(config)) {
     for (const job of store.all<AmpJob>('amp_jobs').filter(job => !terminal(job))) {
       Object.assign(job, { status: 'interrupted', observedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), message: 'HQ restarted while observing this job. Remote work may still be running. Read the thread or live status before retrying.' });
@@ -162,12 +166,12 @@ export class AmpService {
     const { jobId } = ampSchemas.job.parse(input);
     const job = this.store.get<AmpJob>('amp_jobs', jobId);
     if (!job) throw new Error('Job not found. Use amp_jobs_get to find the exact job ID.');
-    return { ...job, observation: 'Persisted HQ observation, not a fresh query to Amp. Succeeded means the requested Amp turn returned a successful result; inspect its text and permission denials for task completion.' };
+    return { ...job, observation: 'Persisted HQ observation, not a fresh query to Amp. Running means an in-flight SDK request is being observed; use live status for remote activity evidence. Succeeded means the requested Amp turn returned a successful result; inspect its text and permission denials for task completion.' };
   }
   getJobs(input: z.input<typeof ampSchemas.jobs> = {}) {
     const { limit, offset } = ampSchemas.jobs.parse(input);
     const jobs = this.store.all<AmpJob>('amp_jobs').sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
-    return { total: jobs.length, jobs: jobs.slice(offset, offset + limit).map(({ prompt: _prompt, latestText, events: _events, ...job }) => ({ ...job, latestText: latestText?.slice(-1500) })), nextOffset: offset + limit < jobs.length ? offset + limit : null };
+    return { observation: 'Persisted HQ job states, not live Amp status. Running means an in-flight SDK request is being observed.', total: jobs.length, jobs: jobs.slice(offset, offset + limit).map(({ prompt: _prompt, latestText, events: _events, ...job }) => ({ ...job, latestText: latestText?.slice(-1500) })), nextOffset: offset + limit < jobs.length ? offset + limit : null };
   }
   async stopMonitor(input: z.input<typeof ampSchemas.job>) {
     const { jobId } = ampSchemas.job.parse(input);
@@ -179,14 +183,16 @@ export class AmpService {
   }
   private async request(request: WorkerRequest) {
     this.enabled();
+    if (this.retrievals.size >= 2) throw new Error('Two Amp reads are already in progress. Try again in a moment.');
     const controller = new AbortController();
+    this.retrievals.add(controller);
     const timeout = setTimeout(() => controller.abort(), request.operation === 'live' ? 12_000 : 45_000);
     timeout.unref();
     try { return await this.adapter.run(request, () => {}, controller.signal); }
     catch (error) {
       if (controller.signal.aborted) throw new Error(request.operation === 'live' ? 'No live Amp snapshot arrived within 12 seconds. Status is unknown.' : 'Amp retrieval timed out. Try again later.');
       throw error;
-    } finally { clearTimeout(timeout); }
+    } finally { clearTimeout(timeout); this.retrievals.delete(controller); }
   }
   async listThreads(input: z.input<typeof ampSchemas.list> = {}) {
     const value = ampSchemas.list.parse(input);
@@ -219,6 +225,7 @@ export class AmpService {
   }
   async close() {
     this.closing = true;
+    for (const controller of this.retrievals) controller.abort();
     for (const active of this.active.values()) active.controller.abort();
     await Promise.all([...this.active.values()].map(active => active.promise));
   }
@@ -227,7 +234,7 @@ export class AmpService {
       { name: 'amp_threads_get', description: 'Fetch fresh thread metadata from your Amp account using the official CLI, with offset pagination. This is not a running/completed status report.', schema: ampSchemas.list, scope: 'amp:read', openWorld: true, run: input => this.listThreads(input) },
       { name: 'amp_thread_read', description: 'Read the latest bounded excerpt of an Amp conversation by exact T-... ID. Use olderCursor plus revision to read older text without mixing revisions.', schema: ampSchemas.read, scope: 'amp:read', openWorld: true, run: input => this.readThread(input) },
       { name: 'amp_live_status', description: 'Fetch one fresh Amp active-thread snapshot. Upstream schema is experimental. If unavailable, status is unknown; never infer completion from absence.', schema: ampSchemas.live, scope: 'amp:read', openWorld: true, run: () => this.liveStatus() },
-      { name: 'amp_work_start', description: 'For an explicit user request, start or continue coding work in the configured Amp cloud sandbox or work runner. Spends Amp credits and can modify code. Returns immediately with a persisted job ID. Requires a unique idempotencyKey; reuse it only for an identical retry. Only remote threads originally created by HQ can be continued; existing account threads remain readable and monitorable.', schema: ampSchemas.start, scope: 'amp:execute', write: true, openWorld: true, run: input => this.start(input) },
+      { name: 'amp_work_start', description: 'For an explicit user request, start or continue coding work in the configured Amp cloud sandbox or work runner. Spends Amp credits and can modify code. Returns immediately with a persisted job ID. Requires a unique idempotencyKey; reuse it only for an identical retry. Only remote threads originally created by HQ can be continued; existing account threads remain readable and monitorable.', schema: ampSchemas.start, scope: 'amp:execute', write: true, destructive: true, openWorld: true, run: input => this.start(input) },
       { name: 'amp_jobs_get', description: 'Read compact persisted observations of jobs dispatched by HQ. Does not query Amp live. Follow nextOffset for older jobs.', schema: ampSchemas.jobs, scope: 'amp:read', run: input => this.getJobs(input) },
       { name: 'amp_job_get', description: 'Read a job’s latest observed assistant text, result, tool names and timestamps. Does not query Amp live.', schema: ampSchemas.job, scope: 'amp:read', run: input => this.getJob(input) },
       { name: 'amp_monitor_stop', description: 'Stop HQ from observing a job. This DOES NOT guarantee that remote Amp execution stops. Tell the user remote work may continue, and inspect or stop it in Amp.', schema: ampSchemas.job, scope: 'amp:execute', write: true, run: input => this.stopMonitor(input) },

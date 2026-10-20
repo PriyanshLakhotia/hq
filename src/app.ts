@@ -17,10 +17,11 @@ export function createApp(config: Config, store: Store, extraTools: ExtraTool[] 
   const oauth = new OAuthProvider(store, config);
   const domain = new Domain(store, () => new Date(), config.timeZone);
   app.disable('x-powered-by');
+  const callbackOrigins = [...new Set(config.redirectUris.map(uri => new URL(uri).origin))].join(' ');
   app.use(hostHeaderValidation([config.publicUrl.hostname, '127.0.0.1', 'localhost']));
   app.use((_req, res, next) => {
     res.set({ 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      'Content-Security-Policy': `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${callbackOrigins}; frame-ancestors 'none'; base-uri 'none'`,
       'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY' });
     if (config.publicUrl.protocol === 'https:') res.set('Strict-Transport-Security', 'max-age=31536000');
     next();

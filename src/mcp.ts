@@ -7,7 +7,7 @@ export const INSTRUCTIONS = `HQ is a personal voice-friendly headquarters. Keep 
 
 export type ExtraTool = {
   name: string; description: string; schema: z.AnyZodObject; scope: string;
-  write?: boolean; openWorld?: boolean;
+  write?: boolean; openWorld?: boolean; destructive?: boolean;
   run: (input: any) => unknown | Promise<unknown>;
 };
 export function createMcpServer(domain: Domain, scopes: string[], extraTools: ExtraTool[] = []) {
@@ -39,7 +39,7 @@ export function createMcpServer(domain: Domain, scopes: string[], extraTools: Ex
     if (!scopes.includes(tool.scope)) continue;
     server.registerTool(tool.name, {
       description: tool.description, inputSchema: tool.schema.shape,
-      annotations: { readOnlyHint: !tool.write, destructiveHint: false, idempotentHint: !tool.write || ['item_update', 'list_archive', 'study_grade'].includes(tool.name), openWorldHint: tool.openWorld ?? false },
+      annotations: { readOnlyHint: !tool.write, destructiveHint: tool.destructive ?? false, idempotentHint: !tool.write || ['item_update', 'list_archive', 'study_grade'].includes(tool.name), openWorldHint: tool.openWorld ?? false },
     }, async (input: Record<string, unknown>): Promise<CallToolResult> => {
       try {
         const data = await tool.run(input);

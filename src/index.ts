@@ -14,7 +14,8 @@ let closing = false;
 function shutdown() {
   if (closing) return;
   closing = true;
-  http.close(() => { void amp.close().then(() => { store.close(); process.exit(0); }); });
+  const workersStopped = amp.close();
+  http.close(() => { void workersStopped.then(() => { store.close(); process.exit(0); }); });
   setTimeout(() => process.exit(1), 10_000).unref();
 }
 process.once('SIGTERM', shutdown);

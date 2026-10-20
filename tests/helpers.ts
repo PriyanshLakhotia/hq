@@ -11,8 +11,7 @@ export const testEnv = {
   COOKIE_SECRET: 'test-cookie-secret-at-least-32-characters',
   OAUTH_REDIRECT_URIS: 'https://chatgpt.com/connector_platform_oauth_redirect',
 };
-export async function fixture() {
-  const store = new Store(':memory:');
+export async function fixture(store = new Store(':memory:')) {
   const config = loadConfig(testEnv);
   const { app, oauth, domain } = createApp(config, store);
   const http = app.listen(0, '127.0.0.1');

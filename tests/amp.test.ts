@@ -51,7 +51,7 @@ test('Amp dispatch returns immediately, preserves progress, retries once and rec
     assert.deepEqual(result.permissionDenials, ['Bash']);
     assert(result.finishedAt);
     assert(!('prompt' in service.getJobs().jobs[0]!));
-    const continued = await service.start({ prompt: 'Explain the finding', threadId: remoteThread, idempotencyKey: 'amp-continue-1' });
+    const continued = await service.start({ prompt: 'Explain the finding', threadId: remoteThread, idempotencyKey: 'retryretry' });
     assert.equal(continued.threadId, remoteThread);
     assert.equal((adapter.requests[1] as any).threadId, remoteThread);
   } finally { await service.close(); store.close(); }
@@ -142,4 +142,33 @@ test('real isolated worker can start the pinned CLI and return a bounded local h
   const output = await adapter.run({ operation: 'read', threadId: '--help' }, () => {}, AbortSignal.timeout(10_000));
   assert.equal(typeof output, 'string');
   assert.match(output as string, /Render a thread as markdown/);
+});
+
+test('Amp execute is excluded from read-only clients and briefings reveal jobs only with Amp read scope', async () => {
+  const { createMcpServer } = await import('../src/mcp.js');
+  const { Domain } = await import('../src/domain.js');
+  const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+  const { InMemoryTransport } = await import('@modelcontextprotocol/sdk/inMemory.js');
+  const store = new Store(':memory:');
+  const adapter = new FakeAmp();
+  const service = new AmpService(store, config(), adapter);
+  try {
+    const job = await service.start({ prompt: 'Private work', idempotencyKey: 'private-work-1' });
+    await service.stopMonitor({ jobId: job.id });
+    for (const scopes of [['hq:read'], ['hq:read', 'amp:read']]) {
+      const server = createMcpServer(new Domain(store), scopes, service.tools());
+      const client = new Client({ name: 'scope-test', version: '1' });
+      const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+      try {
+        await server.connect(serverTransport);
+        await client.connect(clientTransport);
+        const tools = (await client.listTools()).tools;
+        assert(!tools.some(tool => tool.name === 'amp_work_start'));
+        const briefing = await client.callTool({ name: 'ride_briefing', arguments: {} });
+        const result = (briefing.structuredContent as any).data;
+        assert.equal('ampJobObservations' in result, scopes.includes('amp:read'));
+        assert.equal(tools.some(tool => tool.name === 'amp_thread_read'), scopes.includes('amp:read'));
+      } finally { await client.close(); await server.close(); }
+    }
+  } finally { await service.close(); store.close(); }
 });

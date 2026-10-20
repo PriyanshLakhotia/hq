@@ -131,3 +131,48 @@ test('revocation is client-bound and invalidates connected token families', asyn
     assert.equal(testEnv.OAUTH_REDIRECT_URIS.startsWith('https:'), true);
   } finally { await f.close(); }
 });
+
+test('consent refuses wrong passwords and missing browser binding, and permits the registered redirect through CSP', async () => {
+  const f = await fixture();
+  try {
+    const client = await register(f);
+    const { createHash } = await import('node:crypto');
+    const verifier = 'v'.repeat(43);
+    const query = new URLSearchParams({ client_id: client.client_id, redirect_uri: testEnv.OAUTH_REDIRECT_URIS, response_type: 'code', code_challenge_method: 'S256', code_challenge: createHash('sha256').update(verifier).digest('base64url') });
+    const authorization = await f.request('/authorize?' + query);
+    const cookie = authorization.headers.get('set-cookie')!.split(';')[0]!;
+    const location = authorization.headers.get('location')!;
+    assert.equal((await f.request(location)).status, 400);
+    const response = await f.request(location, { headers: { cookie } });
+    assert.match(response.headers.get('content-security-policy')!, /form-action 'self' https:\/\/chatgpt.com;/);
+    const page = await response.text();
+    const csrf = page.match(/name="csrf" value="([^"]+)"/)![1]!;
+    const pending = new URL(location, f.base).searchParams.get('request')!;
+    const post = (tokenValue: string, passwordValue: string) => f.request('/oauth/consent', { method: 'POST', headers: { cookie, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ request: pending, csrf: tokenValue, password: passwordValue, decision: 'allow' }) });
+    assert.equal((await post('é'.repeat(43), 'wrong')).status, 403);
+    assert.equal((await post(csrf, 'wrong password')).status, 401);
+    assert.equal(f.store.all('oauth_codes').length, 0);
+    assert.equal(f.store.all('oauth_access').length, 0);
+  } finally { await f.close(); }
+});
+
+test('OAuth grants and encrypted registered clients survive an actual database/server restart', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { Store } = await import('../src/store.js');
+  const directory = mkdtempSync(join(tmpdir(), 'hq-oauth-restart-'));
+  const path = join(directory, 'hq.db');
+  let f = await fixture(new Store(path));
+  try {
+    const { client, tokens } = await connect(f);
+    f.domain.addItems({ items: [{ title: 'Persist across restart' }] });
+    await f.close();
+    f = await fixture(new Store(path));
+    assert.equal((await f.oauth.verifyAccessToken(tokens.access_token)).clientId, client.client_id);
+    assert.equal((await f.oauth.clientsStore.getClient(client.client_id))?.client_id, client.client_id);
+    assert.equal(f.domain.getItems().items[0]?.title, 'Persist across restart');
+    const refreshed = await f.oauth.exchangeRefreshToken((await f.oauth.clientsStore.getClient(client.client_id))!, tokens.refresh_token);
+    assert(refreshed.access_token);
+  } finally { await f.close(); rmSync(directory, { recursive: true }); }
+});

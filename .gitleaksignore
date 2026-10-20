@@ -1,0 +1,4 @@
+# Exact historical false positive: empty AMP_API_KEY consumed the next env directive.
+d948ec19a584c5737f2d684f580a13f7d4410a88:.env.example:generic-api-key:12
+# Exact historical false positive: synthetic idempotency key, not a credential.
+b4e5eec728167e10a8c5f81abc71b573d8bbb3de:tests/amp.test.ts:generic-api-key:54
