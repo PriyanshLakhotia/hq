@@ -1,4 +1,5 @@
 import express, { type ErrorRequestHandler } from 'express';
+import { z } from 'zod';
 import { rateLimit } from 'express-rate-limit';
 import { hostHeaderValidation } from '@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js';
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
@@ -39,7 +40,10 @@ export function createApp(config: Config, store: Store, extraTools: ExtraTool[] 
     next();
   });
   app.post('/mcp', async (req, res) => {
-    const server = createMcpServer(domain, req.auth!.scopes, extraTools);
+    const server = createMcpServer(domain, req.auth!.scopes, [
+      { name: 'hq_status', description: 'Read HQ capabilities, owner time zone and deployment configuration status, without credentials.', schema: z.object({}), scope: 'hq:read', run: () => ({ version: '0.1.0', timeZone: config.timeZone, features: ['lists', 'capture', 'study', 'briefing'], amp: { enabled: config.ampEnabled, executor: config.ampExecutor, configured: !!config.ampApiKey }, notifications: false, voice: 'Voice tool availability depends on the connected client.' }) },
+      ...extraTools,
+    ]);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
     res.on('close', () => { void transport.close(); void server.close(); });
     await server.connect(transport);

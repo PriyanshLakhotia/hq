@@ -27,7 +27,11 @@ export function createMcpServer(domain: Domain, scopes: string[], extraTools: Ex
     { name: 'study_next', description: 'Start or resume one due review. Returns a question and reviewId, without the answer. Ask the user and wait.', schema: schemas.study_next, scope: 'hq:write', write: true, run: input => domain.nextCard(input) },
     { name: 'study_reveal', description: 'Reveal the current review answer after the user responds or explicitly asks for it.', schema: schemas.study_reveal, scope: 'hq:write', write: true, run: input => domain.revealCard(input) },
     { name: 'study_grade', description: 'Grade a revealed review: again (10 minutes), hard, good, or easy. Schedules the next review. Safe to retry the identical review and grade.', schema: schemas.study_grade, scope: 'hq:write', write: true, run: input => domain.gradeCard(input) },
-    { name: 'ride_briefing', description: 'Read a compact snapshot of urgent/overdue tasks, shopping count, due study decks and recent captures. Amp job observations are included if authorized; they are not live unless explicitly refreshed.', schema: schemas.ride_briefing, scope: 'hq:read', run: input => domain.briefing(input) },
+    { name: 'ride_briefing', description: 'Read a compact snapshot of urgent/overdue tasks, shopping count, due study decks and recent captures. Amp job observations are included if authorized; they are not live unless explicitly refreshed.', schema: schemas.ride_briefing, scope: 'hq:read', run: async input => {
+      const briefing = domain.briefing(input);
+      const jobs = scopes.includes('amp:read') ? extraTools.find(tool => tool.name === 'amp_jobs_get') : undefined;
+      return { ...briefing, ...(jobs ? { ampJobObservations: await jobs.run({ limit: 3 }) } : {}) };
+    } },
     ...extraTools,
   ];
   for (const tool of tools) {
