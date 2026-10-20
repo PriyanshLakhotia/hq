@@ -43,7 +43,9 @@ docker compose up -d --build
 Compose starts one HQ container and one Caddy reverse proxy. Caddy obtains and
 renews HTTPS certificates. HQ has no public host port, runs with a read-only
 root filesystem, and stores SQLite/WAL files on the mounted data directory.
-Its temporary Amp cache lives in a limited `/tmp` tmpfs. Application state does
+Its temporary Amp cache lives in a limited `/tmp` tmpfs. The mount explicitly
+allows execution because the bundled Bun runtime loads extracted native libraries
+from it; a `noexec` tmpfs prevents the CLI from starting. Application state does
 not live in that cache. Compose reads your private `.env`; it is never copied
 into the image. No cloud deployment happens from CI.
 

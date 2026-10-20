@@ -14,7 +14,9 @@ grant other people access expecting separate lists or isolated work accounts.
   and Secure on HTTPS. Forms cannot be framed and third-party resources are absent.
 - Codes expire in two minutes; consent requests in ten minutes. Access tokens
   expire in one hour. Refresh tokens rotate and expire after 30 days. Reuse
-  revokes the grant's entire token family.
+  revokes the grant's entire token family. Confidential registration secrets
+  follow the SDK's 30-day expiry; reconnect when your client requests it. Public
+  PKCE clients do not receive a client secret.
 - Tokens and codes are stored only by SHA-256 hash. Confidential OAuth client
   secrets are encrypted with AES-256-GCM using a key derived from `COOKIE_SECRET`.
   Keep that secret stable and backed up privately.

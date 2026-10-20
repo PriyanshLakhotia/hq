@@ -23,7 +23,10 @@ The implementation was verified with synthetic data and no live account tokens.
   and persistent volume, performs OAuth plus a real MCP write/read, restarts the
   container, reuses the persisted bearer grant, reads the saved item and verifies
   an online backup contains it.
-- Docker Compose configuration validates. Dependency audit reports zero known
+- The compiled Amp worker/CLI starts as the production non-root user on a
+  read-only root filesystem with the executable temporary mount needed by Bun.
+  This runtime check is also included in CI.
+- Docker Compose and Caddy configurations validate. Dependency audit reports zero known
   runtime vulnerabilities. Gitleaks scans source and history with redacted
   output; only two documented exact historical false positives are excluded.
 

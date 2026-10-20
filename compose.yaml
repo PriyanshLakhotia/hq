@@ -13,7 +13,7 @@ services:
       - ${HQ_DATA_DIR:-./data}:/app/data
     read_only: true
     tmpfs:
-      - /tmp:size=256m,mode=1777
+      - /tmp:size=256m,mode=1777,exec
     cap_drop:
       - ALL
     security_opt:
