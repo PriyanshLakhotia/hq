@@ -2,12 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { loadConfig } from '../src/config.js';
 import { hashPassword, verifyPassword } from '../src/security.js';
-
-export const testEnv = {
-  OWNER_PASSWORD_HASH: hashPassword('a test password long enough'),
-  COOKIE_SECRET: 'test-cookie-secret-at-least-32-characters',
-  OAUTH_REDIRECT_URIS: 'https://chatgpt.com/connector_platform_oauth_redirect',
-};
+import { testEnv } from './helpers.js';
 
 test('passwords require strong length and verify without storing plaintext', () => {
   assert.throws(() => hashPassword('short'));

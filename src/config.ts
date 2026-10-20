@@ -1,5 +1,6 @@
 export interface Config {
   port: number;
+  timeZone: string;
   publicUrl: URL;
   databasePath: string;
   passwordHash: string;
@@ -48,8 +49,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (!Number.isInteger(ampJobTimeoutMs) || ampJobTimeoutMs < 1000 || ampJobTimeoutMs > 7_200_000) {
     throw new Error('AMP_JOB_TIMEOUT_MS must be 1000–7200000.');
   }
+  const timeZone = env.TIME_ZONE || 'UTC';
+  try { new Intl.DateTimeFormat('en', { timeZone }).format(); } catch { throw new Error('TIME_ZONE must be an IANA time zone.'); }
   return {
-    port, publicUrl, databasePath: env.DATABASE_PATH || './data/hq.db', passwordHash,
+    timeZone, port, publicUrl, databasePath: env.DATABASE_PATH || './data/hq.db', passwordHash,
     cookieSecret, redirectUris, ampEnabled, ampExecutor, ampApiKey: env.AMP_API_KEY,
     ampRunnerId: env.AMP_RUNNER_ID, ampRunnerDir: env.AMP_RUNNER_DIR,
     ampProject: env.AMP_PROJECT, ampJobTimeoutMs,
