@@ -15,7 +15,7 @@ import { homePage } from './pages.js';
 export function createApp(config: Config, store: Store, extraTools: ExtraTool[] = []) {
   const app = express();
   const oauth = new OAuthProvider(store, config);
-  const domain = new Domain(store, () => new Date(), config.timeZone);
+  const domain = new Domain(store);
   app.disable('x-powered-by');
   const callbackOrigins = [...new Set(config.redirectUris.map(uri => new URL(uri).origin))].join(' ');
   app.use(hostHeaderValidation([config.publicUrl.hostname, '127.0.0.1', 'localhost']));
@@ -42,7 +42,7 @@ export function createApp(config: Config, store: Store, extraTools: ExtraTool[] 
   });
   app.post('/mcp', async (req, res) => {
     const server = createMcpServer(domain, req.auth!.scopes, [
-      { name: 'hq_status', description: 'Read HQ capabilities, owner time zone and deployment configuration status, without credentials.', schema: z.object({}), scope: 'hq:read', run: () => ({ version: '0.1.0', timeZone: config.timeZone, features: ['lists', 'capture', 'study', 'briefing'], amp: { enabled: config.ampEnabled, executor: config.ampExecutor, configured: !!config.ampApiKey }, notifications: false, voice: 'Voice tool availability depends on the connected client.' }) },
+      { name: 'hq_status', description: 'Read HQ capabilities, owner time zone and server configuration status, without credentials.', schema: z.object({}), scope: 'hq:read', run: () => ({ version: '0.1.0', timeZone: config.timeZone, features: ['lists', 'amp'], amp: { enabled: config.ampEnabled, executor: config.ampExecutor, configured: !!config.ampApiKey }, voice: 'Voice tool availability depends on the connected client.' }) },
       ...extraTools,
     ]);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

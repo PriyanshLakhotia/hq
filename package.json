@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A personal, voice-first MCP headquarters for lists, learning, capture and Amp.",
+  "description": "A personal MCP server for lists and Amp.",
   "engines": {
     "node": ">=24.0.0"
   },

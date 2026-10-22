@@ -8,12 +8,12 @@ import { Domain } from '../src/domain.js';
 
 const fixture = () => {
   const store = new Store(':memory:');
-  let time = new Date('2026-10-20T10:00:00Z');
+  const time = new Date('2026-10-20T10:00:00Z');
   const domain = new Domain(store, () => time);
-  return { store, domain, advance: (days: number) => { time = new Date(time.valueOf() + days * 86_400_000); } };
+  return { store, domain };
 };
 
-test('default lists, batch capture, exact IDs, completion, restoration and pagination', () => {
+test('default lists, batch additions, exact IDs, completion, restoration and pagination', () => {
   const { store, domain } = fixture();
   try {
     assert.deepEqual(domain.getLists().map(list => list.name).sort(), ['Shopping', 'TODO']);
@@ -58,53 +58,23 @@ test('custom lists normalize names and archive without losing their items', () =
   } finally { store.close(); }
 });
 
-test('notes search combines words and tags and persists after reopening SQLite', () => {
+test('lists and item state persist after reopening SQLite', () => {
   const directory = mkdtempSync(join(tmpdir(), 'hq-test-'));
   const path = join(directory, 'test.db');
   let store = new Store(path);
   try {
-    new Domain(store).captureNote({ title: 'Cache decision', body: 'Use Redis for the session cache.', tags: ['Work', 'work'] });
+    const domain = new Domain(store);
+    const list = domain.createList({ name: 'Work' });
+    const [item] = domain.addItems({ list: list.id, items: [{ title: 'Review the cache', priority: 'high', dueDate: '2026-11-01' }] });
+    domain.updateItem({ itemId: item!.id, status: 'done' });
     store.close();
     store = new Store(path);
-    const result = new Domain(store).searchNotes({ query: 'redis session', tag: 'WORK' });
+    const result = new Domain(store).getItems({ list: 'Work', status: 'done' });
     assert.equal(result.total, 1);
-    assert.deepEqual(result.items[0]!.tags, ['work']);
+    assert.equal(result.items[0]!.id, item!.id);
+    assert.equal(result.items[0]!.title, 'Review the cache');
+    assert.equal(result.items[0]!.priority, 'high');
+    assert.equal(result.items[0]!.dueDate, '2026-11-01');
+    assert(result.items[0]!.completedAt);
   } finally { store.close(); rmSync(directory, { recursive: true }); }
-});
-
-test('study hides answers, preserves pending questions and schedules idempotent reviews', () => {
-  const { store, domain, advance } = fixture();
-  try {
-    domain.createDeck({ name: 'Systems' });
-    domain.addCards({ deck: 'Systems', cards: [{ question: 'What is idempotency?', answer: 'Retries have the same effect as one request.' }] });
-    const next = domain.nextCard({ deck: 'Systems' });
-    assert(!next.done);
-    if (next.done) return;
-    assert(!('answer' in next));
-    assert.deepEqual(domain.nextCard({ deck: 'Systems' }), next);
-    assert.throws(() => domain.gradeCard({ reviewId: next.reviewId, rating: 'good' }), /Reveal/);
-    assert.match(domain.revealCard({ reviewId: next.reviewId }).answer, /Retries/);
-    const result = domain.gradeCard({ reviewId: next.reviewId, rating: 'good' });
-    assert.equal(result.intervalDays, 1);
-    assert.deepEqual(domain.gradeCard({ reviewId: next.reviewId, rating: 'good' }), result);
-    assert.throws(() => domain.gradeCard({ reviewId: next.reviewId, rating: 'easy' }), /different input/);
-    assert(domain.nextCard({ deck: 'Systems' }).done);
-    advance(1);
-    assert(!domain.nextCard({ deck: 'Systems' }).done);
-  } finally { store.close(); }
-});
-
-test('briefings count overdue work while excluding archived lists and shopping', () => {
-  const { store, domain } = fixture();
-  try {
-    domain.addItems({ items: [{ title: 'Submit expenses', dueDate: '2026-10-19' }] });
-    domain.addItems({ list: 'shopping', items: [{ title: 'Bread', dueDate: '2026-10-18' }] });
-    const list = domain.createList({ name: 'Old project' });
-    domain.addItems({ list: list.id, items: [{ title: 'Old task', dueDate: '2026-10-18' }] });
-    domain.archiveList({ list: list.id });
-    const briefing = domain.briefing();
-    assert.equal(briefing.overdue, 1);
-    assert.equal(briefing.shopping.openItems, 1);
-    assert.equal(briefing.attention[0]?.title, 'Submit expenses');
-  } finally { store.close(); }
 });

@@ -73,5 +73,5 @@ concurrency, history revisions, environment isolation, and the real installed
 CLI/worker startup without network access. Live account behavior requires your
 private token and outbound HTTPS to Amp. CLI flags were checked against the
 pinned installed binary. Account access and the exact upstream list/live JSON
-payloads still need a live smoke test on your deployment; HQ preserves those
+payloads still need a live smoke test on your server; HQ preserves those
 payloads instead of inventing statuses or depending on undocumented field names.

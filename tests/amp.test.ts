@@ -144,7 +144,7 @@ test('real isolated worker can start the pinned CLI and return a bounded local h
   assert.match(output as string, /Render a thread as markdown/);
 });
 
-test('Amp execute is excluded from read-only clients and briefings reveal jobs only with Amp read scope', async () => {
+test('Amp tools and saved jobs require their read or execute scopes', async () => {
   const { createMcpServer } = await import('../src/mcp.js');
   const { Domain } = await import('../src/domain.js');
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
@@ -164,9 +164,14 @@ test('Amp execute is excluded from read-only clients and briefings reveal jobs o
         await client.connect(clientTransport);
         const tools = (await client.listTools()).tools;
         assert(!tools.some(tool => tool.name === 'amp_work_start'));
-        const briefing = await client.callTool({ name: 'ride_briefing', arguments: {} });
-        const result = (briefing.structuredContent as any).data;
-        assert.equal('ampJobObservations' in result, scopes.includes('amp:read'));
+        if (scopes.includes('amp:read')) {
+          const response = await client.callTool({ name: 'amp_jobs_get', arguments: {} });
+          assert.equal((response.structuredContent as any).data.jobs[0].id, job.id);
+        } else {
+          assert(!tools.some(tool => tool.name.startsWith('amp_')));
+          const denied = await client.callTool({ name: 'amp_jobs_get', arguments: {} });
+          assert.equal(denied.isError, true);
+        }
         assert.equal(tools.some(tool => tool.name === 'amp_thread_read'), scopes.includes('amp:read'));
       } finally { await client.close(); await server.close(); }
     }

@@ -71,14 +71,16 @@ test('official MCP client can initialize, list tools, write, read and receive do
     const { tokens } = await connect(f);
     await client.connect(new StreamableHTTPClientTransport(new URL('/mcp', f.base), { requestInit: { headers: { Authorization: `Bearer ${tokens.access_token}` } } }));
     const tools = await client.listTools();
-    assert(tools.tools.some(tool => tool.name === 'items_add'));
-    assert(tools.tools.some(tool => tool.name === 'ride_briefing'));
+    assert.deepEqual(tools.tools.map(tool => tool.name).sort(),
+      ['hq_status', 'lists_get', 'list_create', 'list_archive', 'items_add', 'items_get', 'item_update'].sort());
     assert.equal((await client.callTool({ name: 'items_add', arguments: { list: 'shopping', items: [{ title: 'Bread' }], idempotencyKey: 'http-write-1' } })).isError, undefined);
     const read = await client.callTool({ name: 'items_get', arguments: { list: 'shopping' } });
     assert.equal((read.structuredContent as any).data.items[0].title, 'Bread');
     const invalid = await client.callTool({ name: 'item_update', arguments: { itemId: 'not-an-item', status: 'done' } });
     assert.equal(invalid.isError, true);
-    assert.equal((await client.listPrompts()).prompts.length, 3);
+    assert.equal(client.getServerCapabilities()?.prompts, undefined);
+    const status = await client.callTool({ name: 'hq_status', arguments: {} });
+    assert.deepEqual((status.structuredContent as any).data.features, ['lists', 'amp']);
     const origin = await f.request('/mcp', { method: 'POST', headers: { Authorization: `Bearer ${tokens.access_token}`, origin: 'https://attacker.example', 'content-type': 'application/json' }, body: '{}' });
     assert.equal(origin.status, 403);
   } finally { await client.close(); await f.close(); }

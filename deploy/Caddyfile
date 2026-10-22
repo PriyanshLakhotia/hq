@@ -1,8 +1,0 @@
-{
-	email {$ACME_EMAIL}
-}
-
-{$HQ_DOMAIN} {
-	reverse_proxy hq:8080
-	# Access logging is deliberately not enabled: OAuth URLs contain flow state.
-}
