@@ -1,34 +1,40 @@
 # Security
 
-HQ is a single-owner server. Every authorized client accesses that owner's
-lists and Amp account; it does not isolate multiple users.
+HQ is single-owner. Authorized clients share the same lists and Amp account.
 
-- OAuth uses authorization codes, S256 PKCE, exact allowlisted HTTPS callbacks,
-  owner-password consent, browser binding, and CSRF protection.
-- Lists use `hq:read` / `hq:write`; Amp uses `amp:read` / `amp:execute`.
-  Each client sees only the tools its token permits.
-- Codes expire in two minutes, consent requests in ten minutes, access tokens
-  in one hour, and refresh tokens in 30 days. Refresh rotation detects reuse
-  and revokes the token family. Confidential client secrets follow the SDK's
-  30-day expiry; public PKCE clients do not receive a client secret.
-- Tokens and codes are stored by hash. Confidential client secrets are encrypted
-  with AES-256-GCM using a key derived from `COOKIE_SECRET`; keep that value stable.
-  The owner password is stored only as a scrypt hash.
-- SQLite files use private permissions, but list data and work output are
-  plaintext. Restrict access to the database and server environment.
-- Host/Origin checks, body limits, OAuth rate limits, and a stricter consent
-  attempt limit protect the HTTP endpoints. Proxy headers are not trusted.
-- Amp runs in a child process with an environment whitelist that excludes HQ's
-  OAuth and cloud credentials. Execution uses remote Amp executors, and only
-  remote threads created by HQ can be continued. `amp:execute` can modify code
-  and spend account credits; Amp's remote permissions govern that work.
-- List text and Amp history are untrusted content. The MCP instructions tell
-  the assistant to treat them as data and require explicit requests for execution.
+OAuth uses S256 PKCE, exact HTTPS callback allowlists, owner-password consent,
+browser binding and CSRF protection. Codes expire in two minutes, consent in ten
+minutes, access tokens in one hour and rotating refresh tokens in 30 days.
+Refresh replay marks a shared Firestore token family revoked atomically. Codes
+and tokens are stored by hash; confidential client secrets are AES-256-GCM
+encrypted using `COOKIE_SECRET`. The owner password is a scrypt hash. Keep the
+cookie secret stable. Client registration secrets use the SDK's 30-day expiry.
 
-Keep real `.env` values, tokens, passwords, databases, private work output and
-credential files outside Git. HQ does not log request bodies, authorization
-headers, OAuth codes, owner passwords or raw Amp stderr.
+Lists use `hq:read` / `hq:write`; Amp uses `amp:read` / `amp:execute`. Tools outside
+the grant are not registered. Host/Origin checks and HTTP/body limits remain.
+Rate limits are per-process protection, not a distributed spending cap.
 
-CI runs Gitleaks. `.gitleaksignore` contains only two exact historical false
-positives: an empty environment assignment and a synthetic test idempotency key.
-No secret rules or directories are broadly excluded.
+Cloud Run's front-door Invoker IAM check is disabled so ChatGPT's custom OAuth
+bearer tokens reach the app. `/mcp` requires HQ OAuth. `/internal/*` requires a
+Google-signed OIDC ID token with the configured audience and the exact verified
+`TASKS_SERVICE_ACCOUNT` email. Task headers and normal HQ tokens cannot authorize
+workers. Cloud Tasks and Scheduler mint tokens via managed service identities.
+No shared worker password or public unauthenticated execution route exists.
+
+All persistent data is Firestore, accessed using the attached runtime identity.
+Firebase client rules deny all reads/writes; server IAM is separate. There is no
+bundled service-account key or local production database. Memory is development
+only and rejected on Cloud Run. The emulator is also rejected on Cloud Run.
+Firestore protects data at rest; authorized server identities can read its stored
+list/work content. Restrict those identities and project access accordingly.
+
+Secrets belong in Secret Manager and private local config. Docker/Cloud Build
+use explicit source allowlists. Do not log bearer values, prompts, raw upstream
+errors or private work output. SDK child processes inherit only allowed runtime
+variables plus the Amp token, not HQ OAuth secrets or Google credential files.
+Amp uses remote executors and does not automatically rerun uncertain work.
+
+CI scans dependencies and runs Gitleaks; `.gitleaksignore` contains two exact
+historical synthetic false positives, not broad exclusions. Treat list text and
+Amp content as untrusted data. `amp:execute` can modify remote work and spend
+credits, and requires an explicit user request.

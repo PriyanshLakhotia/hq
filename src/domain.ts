@@ -24,7 +24,6 @@ export const schemas = {
     dueDate: date.nullable().optional(), quantity: z.string().trim().max(80).nullable().optional(),
     notes: z.string().trim().max(1000).optional(), idempotencyKey: key,
   }).refine(value => ['title', 'status', 'priority', 'dueDate', 'quantity', 'notes'].some(k => k in value), 'Provide an update.'),
-
 };
 
 type Input<K extends keyof typeof schemas> = z.input<(typeof schemas)[K]>;

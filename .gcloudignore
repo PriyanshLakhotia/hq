@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!.dockerignore
+!.gcloudignore
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+!tests/
+!tests/**
+!scripts/
+!scripts/**

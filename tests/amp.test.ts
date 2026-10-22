@@ -127,3 +127,21 @@ test('isolated workers exclude Google/HQ credentials and the real installed CLI 
   const output = await new ProcessAmpAdapter(loadConfig(testEnv)).run({ operation: 'read', threadId: '--help' }, () => {}, AbortSignal.timeout(10_000));
   assert.match(output as string, /Render a thread as markdown/);
 });
+
+test('late deliveries expire without executing, and a worker cannot exceed an earlier admission reservation', async () => {
+  const store = new Store(); const queue = new FakeQueue(); const adapter = new FakeAmp();
+  const initial = new AmpService(store, config(), adapter, queue);
+  const old = await initial.start({ prompt: 'Old task', idempotencyKey: 'expired-request-1' });
+  await store.put('amp_jobs', old.id, { ...await store.get<AmpJob>('amp_jobs', old.id), createdAt: new Date(Date.now() - 24 * 3_600_000).toISOString() });
+  await initial.runQueued(old.id); assert.equal(adapter.calls.length, 0);
+  assert.equal((await initial.getJob({ jobId: old.id })).status, 'interrupted');
+  const shortService = new AmpService(store, config({ AMP_JOB_TIMEOUT_MS: '1000' }), adapter, queue);
+  const short = await shortService.start({ prompt: 'Bounded task', idempotencyKey: 'bounded-request-1' });
+  const raised = new AmpService(store, config({ AMP_JOB_TIMEOUT_MS: '1200000' }), adapter, queue);
+  const before = Date.now();
+  await raised.runQueued(short.id);
+  assert(Date.now() - before < 5000);
+  assert.equal((await raised.getJob({ jobId: short.id })).status, 'interrupted');
+  assert.equal(adapter.calls.length, 1);
+  await initial.close(); await shortService.close(); await raised.close(); await store.close();
+});

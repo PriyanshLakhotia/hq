@@ -15,8 +15,24 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
+      - name: Start Firestore emulator
+        run: >-
+          docker run -d --name firestore -p 127.0.0.1:8787:8787
+          gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+          gcloud beta emulators firestore start --host-port=0.0.0.0:8787 --project=demo-hq --quiet
+      - name: Wait for emulator
+        run: node scripts/wait-emulator.mjs
       - run: npm run verify
-      - run: npm audit --omit=dev --audit-level=high
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8787
+      - run: npm audit --omit=dev --audit-level=moderate
+      - name: Build production image
+        run: docker build -t hq-mcp:test .
+      - name: Check non-root runtime
+        run: >-
+          docker run --rm --read-only --tmpfs /tmp:size=256m,mode=1777,exec
+          --cap-drop ALL --security-opt no-new-privileges:true
+          --entrypoint node hq-mcp:test scripts/check-amp-runtime.mjs
   secrets:
     runs-on: ubuntu-latest
     steps:

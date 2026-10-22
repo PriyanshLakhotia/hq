@@ -13,6 +13,7 @@ const settings = () => loadConfig({ ...testEnv, PUBLIC_URL: 'https://hq.example.
 test('Cloud Run fails closed on ephemeral storage, manual dispatch, emulator configuration and unbounded timeouts', () => {
   assert.throws(() => loadConfig({ ...testEnv, K_SERVICE: 'hq', STORAGE_BACKEND: 'memory' }), /requires Firestore/);
   assert.throws(() => loadConfig({ ...testEnv, K_SERVICE: 'hq', GOOGLE_CLOUD_PROJECT: 'demo-hq', JOB_BACKEND: 'manual' }), /durable Cloud Tasks/);
+  assert.throws(() => loadConfig({ ...testEnv, K_SERVICE: 'hq', GOOGLE_CLOUD_PROJECT: 'demo-hq', FIRESTORE_EMULATOR_HOST: '127.0.0.1:8787' }), /emulator/);
   assert.throws(() => loadConfig({ ...testEnv, AMP_JOB_TIMEOUT_MS: '1800001' }), /1000–1200000/);
   assert.throws(() => loadConfig({ ...testEnv, AMP_DAILY_BUDGET_SECONDS: '100' }), /daily Amp limits/);
   assert.throws(() => loadConfig({ ...testEnv, JOB_BACKEND: 'cloudtasks' }), /Cloud Tasks requires/);

@@ -14,3 +14,7 @@ coverage/
 *.key
 credentials*.json
 service-account*.json
+.firebase/
+*-debug.log
+deploy/*.local.yaml
+*.private.*

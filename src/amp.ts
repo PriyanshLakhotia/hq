@@ -149,6 +149,10 @@ export class AmpService {
       const current = await tx.get<AmpJob>('amp_jobs', jobId);
       if (!current || terminal(current)) return undefined;
       const now = Date.now();
+      if (current.status === 'queued' && Date.parse(current.createdAt) < now - 23 * 3_600_000) {
+        await this.finish(tx, current, 'interrupted', 'Queued delivery expired before work started.');
+        return undefined;
+      }
       if (current.status === 'running') {
         if ((current.leaseUntil ?? 0) > now) throw new TaskBusyError('This job is already being observed.');
         await this.finish(tx, current, 'interrupted', 'Worker lease expired. Remote Amp work may continue; inspect the thread before starting more work.');
@@ -158,7 +162,7 @@ export class AmpService {
       if (lock && lock.expiresAt > now) throw new TaskBusyError('Another job is using the worker slot.');
       current.status = 'running'; current.startedAt = new Date(now).toISOString();
       current.observedAt = current.startedAt; current.lease = lease;
-      current.leaseUntil = now + this.config.ampJobTimeoutMs + 120_000;
+      current.leaseUntil = now + Math.min(this.config.ampJobTimeoutMs, current.reservedSeconds * 1000) + 120_000;
       tx.put('amp_control', 'worker', { jobId, lease, expiresAt: current.leaseUntil } satisfies WorkerLock);
       tx.put('amp_jobs', jobId, current);
       return current;
@@ -166,7 +170,7 @@ export class AmpService {
     if (!job) return;
     const controller = new AbortController();
     this.workers.set(jobId, controller);
-    const timeout = setTimeout(() => controller.abort(), this.config.ampJobTimeoutMs);
+    const timeout = setTimeout(() => controller.abort(), Math.min(this.config.ampJobTimeoutMs, job.reservedSeconds * 1000));
     let persistence: Promise<void> = Promise.resolve();
     const flush = () => {
       persistence = persistence.then(async () => {
@@ -183,7 +187,7 @@ export class AmpService {
       }).catch(() => { controller.abort(); });
       return persistence;
     };
-    // Coalesce progress and cross-instance stop checks into one write per 10 seconds.
+    // Coalesce progress and cross-instance stop checks into one persistence flush per 10 seconds.
     const heartbeat = setInterval(() => { void flush(); }, 10_000);
     let resultSeen = false;
     try {

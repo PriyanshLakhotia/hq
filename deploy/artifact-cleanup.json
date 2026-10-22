@@ -1,0 +1,4 @@
+[
+  { "name": "delete-old", "action": { "type": "Delete" }, "condition": { "tagState": "any", "olderThan": "604800s" } },
+  { "name": "keep-two", "action": { "type": "Keep" }, "mostRecentVersions": { "keepCount": 2 } }
+]
