@@ -1,0 +1,17 @@
+{
+  "indexes": [
+    { "collectionGroup": "records", "queryScope": "COLLECTION", "fields": [
+      { "fieldPath": "fields.listId", "order": "ASCENDING" },
+      { "fieldPath": "fields.status", "order": "ASCENDING" },
+      { "fieldPath": "fields.sortKey", "order": "ASCENDING" }
+    ] },
+    { "collectionGroup": "records", "queryScope": "COLLECTION", "fields": [
+      { "fieldPath": "fields.listId", "order": "ASCENDING" },
+      { "fieldPath": "fields.sortKey", "order": "ASCENDING" }
+    ] }
+  ],
+  "fieldOverrides": [
+    { "collectionGroup": "records", "fieldPath": "body", "indexes": [] },
+    { "collectionGroup": "records", "fieldPath": "id", "indexes": [] }
+  ]
+}

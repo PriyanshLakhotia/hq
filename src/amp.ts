@@ -2,8 +2,9 @@ import { fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { Config } from './config.js';
-import { Store } from './store.js';
+import { Store, type Transaction } from './store.js';
 import { digest } from './security.js';
+import type { TaskQueue } from './tasks.js';
 import type { ExtraTool } from './mcp.js';
 import type { AmpEvent, WorkerReply, WorkerRequest } from './amp-protocol.js';
 
@@ -22,6 +23,9 @@ export interface AmpJob {
   createdAt: string; observedAt: string; finishedAt?: string; latestText?: string;
   events: { at: string; type: string; tools?: string[] }[];
   permissionDenials?: string[]; message?: string;
+  requestedThreadId?: string; runnerId?: string; runnerDir?: string; project?: string;
+  usageDay: string; reservedSeconds: number; dispatchState: 'pending' | 'scheduled';
+  startedAt?: string; lease?: string; leaseUntil?: number; stopRequested?: boolean; expiresAt: number;
 }
 export interface AmpAdapter { run(request: WorkerRequest, onEvent: (event: AmpEvent) => void, signal: AbortSignal): Promise<unknown> }
 const terminal = (job: AmpJob) => !['queued', 'running'].includes(job.status);
@@ -77,109 +81,197 @@ export class ProcessAmpAdapter implements AmpAdapter {
   }
 }
 
+export class TaskBusyError extends Error {}
+interface Usage { jobs: number; seconds: number; expiresAt: number }
+interface WorkerLock { jobId: string; lease: string; expiresAt: number }
+interface ThreadTarget { executor: 'orb' | 'runner'; runnerId?: string; runnerDir?: string; project?: string; activeJobId?: string }
+
 export class AmpService {
-  private active = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private closing = false;
   private retrievals = new Set<AbortController>();
-  constructor(readonly store: Store, readonly config: Config, readonly adapter: AmpAdapter = new ProcessAmpAdapter(config)) {
-    for (const job of store.all<AmpJob>('amp_jobs').filter(job => !terminal(job))) {
-      Object.assign(job, { status: 'interrupted', observedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), message: 'HQ restarted while observing this job. Remote work may still be running. Read the thread or live status before retrying.' });
-      store.put('amp_jobs', job.id, job);
-    }
-  }
+  private workers = new Map<string, AbortController>();
+  constructor(readonly store: Store, readonly config: Config, readonly adapter: AmpAdapter = new ProcessAmpAdapter(config),
+    readonly queue: TaskQueue = { enqueue: async () => {} }) {}
   private enabled() {
-    if (!this.config.ampEnabled) throw new Error('Amp is disabled. Configure AMP_API_KEY and AMP_ENABLED on the host, then restart. Never paste a token into chat.');
+    if (!this.config.ampEnabled) throw new Error('Amp is disabled. Configure AMP_API_KEY and AMP_ENABLED privately on the server.');
     if (this.closing) throw new Error('HQ is shutting down. Retry after it restarts.');
   }
   async start(input: z.input<typeof ampSchemas.start>) {
     this.enabled();
     const value = ampSchemas.start.parse(input);
     if (value.threadId && value.title) throw new Error('A title can only be set when starting a new thread.');
-    if (value.threadId && !this.store.get('amp_remote_threads', value.threadId)) {
-      throw new Error('Only remote threads originally created by HQ can be continued here. Existing account threads can be read and monitored; start a new HQ thread for execution.');
-    }
-    let created = false;
-    const job = this.store.write('amp_start', value.idempotencyKey, value, () => {
-      if (this.active.size >= 2) throw new Error('Two Amp jobs are already being monitored. Wait for one to finish.');
-      if (value.threadId && this.store.all<AmpJob>('amp_jobs').some(job => job.threadId === value.threadId && !terminal(job))) throw new Error('This thread already has an active HQ job. Read that job before sending more work.');
+    const jobId = await this.store.write('amp_start', value.idempotencyKey, value, async tx => {
+      const target = value.threadId ? await tx.get<ThreadTarget>('amp_remote_threads', value.threadId) : undefined;
+      if (value.threadId && !target) throw new Error('Only remote threads originally created by HQ can be continued here.');
+      if (target?.activeJobId) throw new Error('This thread already has a queued or running HQ job.');
+      const day = new Date().toISOString().slice(0, 10);
+      const usage = await tx.get<Usage>('amp_usage', day) ?? { jobs: 0, seconds: 0, expiresAt: Date.now() + 35 * 86_400_000 };
+      const reservedSeconds = Math.ceil(this.config.ampJobTimeoutMs / 1000);
+      if (usage.jobs >= this.config.ampMaxJobsPerDay || usage.seconds + reservedSeconds > this.config.ampDailyBudgetSeconds) {
+        throw new Error('Daily Amp job/time limit reached. Inspect existing work or wait until the next UTC day.');
+      }
+      usage.jobs++; usage.seconds += reservedSeconds;
       const now = new Date().toISOString();
-      const record: AmpJob = { id: randomUUID(), status: 'queued', title: value.title ?? (value.threadId ? 'Continue thread' : value.prompt.slice(0, 100)), prompt: value.prompt,
-        threadId: value.threadId, executor: value.threadId ? this.store.get<{ executor: 'orb' | 'runner' }>('amp_remote_threads', value.threadId)!.executor : this.config.ampExecutor, mode: value.mode, createdAt: now, observedAt: now, events: [] };
-      this.store.put('amp_jobs', record.id, record);
-      created = true;
-      return record;
+      const record: AmpJob = { id: randomUUID(), status: 'queued', title: value.title ?? (value.threadId ? 'Continue thread' : value.prompt.slice(0, 100)),
+        prompt: value.prompt, threadId: value.threadId, requestedThreadId: value.threadId, executor: target?.executor ?? this.config.ampExecutor,
+        runnerId: target?.runnerId ?? this.config.ampRunnerId, runnerDir: target?.runnerDir ?? this.config.ampRunnerDir,
+        project: target?.project ?? this.config.ampProject, mode: value.mode, createdAt: now, observedAt: now, events: [],
+        usageDay: day, reservedSeconds, dispatchState: 'pending', expiresAt: Date.now() + 30 * 86_400_000 };
+      tx.put('amp_usage', day, usage);
+      tx.put('amp_jobs', record.id, record);
+      if (target && value.threadId) tx.put('amp_remote_threads', value.threadId, { ...target, activeJobId: record.id });
+      return record.id;
     });
-    if (created) {
-      const controller = new AbortController();
-      const state = { controller, promise: Promise.resolve() };
-      this.active.set(job.id, state);
-      state.promise = this.execute(job.id, value, controller).finally(() => this.active.delete(job.id));
-    }
-    // A retried request returns current observation rather than its original queued snapshot.
-    return this.getJob({ jobId: job.id });
+    await this.schedule(jobId);
+    return this.getJob({ jobId });
   }
-  private async execute(jobId: string, input: z.output<typeof ampSchemas.start>, controller: AbortController) {
-    const job = this.store.get<AmpJob>('amp_jobs', jobId)!;
-    job.status = 'running';
-    job.observedAt = new Date().toISOString();
-    this.store.put('amp_jobs', job.id, job);
-    const timer = setTimeout(() => controller.abort(), this.config.ampJobTimeoutMs);
-    timer.unref();
+  private async schedule(jobId: string) {
+    const job = await this.store.get<AmpJob>('amp_jobs', jobId);
+    if (!job || job.status !== 'queued') return;
     try {
-      await this.adapter.run({ operation: 'execute', prompt: input.prompt, threadId: input.threadId, title: input.title,
-        executor: this.config.ampExecutor, runnerId: this.config.ampRunnerId, runnerDir: this.config.ampRunnerDir,
-        project: this.config.ampExecutor === 'orb' ? this.config.ampProject : undefined, mode: input.mode,
+      await this.queue.enqueue(jobId);
+      await this.store.transaction(async tx => {
+        const fresh = await tx.get<AmpJob>('amp_jobs', jobId);
+        if (fresh?.status === 'queued') tx.put('amp_jobs', jobId, { ...fresh, dispatchState: 'scheduled', message: undefined });
+      });
+    } catch {
+      await this.store.transaction(async tx => {
+        const fresh = await tx.get<AmpJob>('amp_jobs', jobId);
+        if (fresh?.status === 'queued') tx.put('amp_jobs', jobId, { ...fresh, dispatchState: 'pending', message: 'Saved but not scheduled yet. Maintenance will retry scheduling; retrying the identical request is safe.' });
+      });
+    }
+  }
+  async runQueued(jobId: string) {
+    this.enabled();
+    ampSchemas.job.parse({ jobId });
+    const lease = randomUUID();
+    const job = await this.store.transaction(async tx => {
+      const current = await tx.get<AmpJob>('amp_jobs', jobId);
+      if (!current || terminal(current)) return undefined;
+      const now = Date.now();
+      if (current.status === 'running') {
+        if ((current.leaseUntil ?? 0) > now) throw new TaskBusyError('This job is already being observed.');
+        await this.finish(tx, current, 'interrupted', 'Worker lease expired. Remote Amp work may continue; inspect the thread before starting more work.');
+        return undefined;
+      }
+      const lock = await tx.get<WorkerLock>('amp_control', 'worker');
+      if (lock && lock.expiresAt > now) throw new TaskBusyError('Another job is using the worker slot.');
+      current.status = 'running'; current.startedAt = new Date(now).toISOString();
+      current.observedAt = current.startedAt; current.lease = lease;
+      current.leaseUntil = now + this.config.ampJobTimeoutMs + 120_000;
+      tx.put('amp_control', 'worker', { jobId, lease, expiresAt: current.leaseUntil } satisfies WorkerLock);
+      tx.put('amp_jobs', jobId, current);
+      return current;
+    });
+    if (!job) return;
+    const controller = new AbortController();
+    this.workers.set(jobId, controller);
+    const timeout = setTimeout(() => controller.abort(), this.config.ampJobTimeoutMs);
+    let persistence: Promise<void> = Promise.resolve();
+    const flush = () => {
+      persistence = persistence.then(async () => {
+        await this.store.transaction(async tx => {
+          const fresh = await tx.get<AmpJob>('amp_jobs', jobId);
+          if (!fresh || fresh.lease !== lease || terminal(fresh)) { controller.abort(); return; }
+          if (fresh.stopRequested) { job.stopRequested = true; controller.abort(); }
+          // Preserve the claimed lease; do not extend past the bounded worker deadline.
+          tx.put('amp_jobs', jobId, { ...job, status: 'running', stopRequested: fresh.stopRequested });
+          if (job.threadId && !job.requestedThreadId) {
+            tx.put('amp_remote_threads', job.threadId, { executor: job.executor, runnerId: job.runnerId, runnerDir: job.runnerDir, project: job.project, activeJobId: job.id } satisfies ThreadTarget);
+          }
+        });
+      }).catch(() => { controller.abort(); });
+      return persistence;
+    };
+    // Coalesce progress and cross-instance stop checks into one write per 10 seconds.
+    const heartbeat = setInterval(() => { void flush(); }, 10_000);
+    let resultSeen = false;
+    try {
+      await this.adapter.run({ operation: 'execute', prompt: job.prompt, threadId: job.requestedThreadId,
+        title: job.requestedThreadId ? undefined : job.title, executor: job.executor, runnerId: job.runnerId,
+        runnerDir: job.runnerDir, project: job.executor === 'orb' ? job.project : undefined, mode: job.mode as 'medium',
       }, event => {
         job.observedAt = new Date().toISOString();
-        if (event.sessionId && threadId.safeParse(event.sessionId).success) {
-          job.threadId = event.sessionId;
-          if (!input.threadId) this.store.put('amp_remote_threads', event.sessionId, { id: event.sessionId, executor: this.config.ampExecutor, createdAt: job.createdAt });
-        }
+        if (event.sessionId && threadId.safeParse(event.sessionId).success) job.threadId = event.sessionId;
         if (event.text) job.latestText = event.text.slice(-16000);
+        job.events = [...job.events, { at: job.observedAt, type: event.type, tools: event.tools }].slice(-10);
         if (event.type === 'result') {
-          job.status = event.success ? 'succeeded' : 'failed';
-          job.permissionDenials = event.permissionDenials;
-          job.finishedAt = job.observedAt;
+          resultSeen = true; job.status = event.success ? 'succeeded' : 'failed'; job.permissionDenials = event.permissionDenials;
         }
-        job.events = [...job.events, { at: job.observedAt, type: event.type, tools: event.tools }].slice(-20);
-        this.store.put('amp_jobs', job.id, job);
+        if (event.type === 'system') void flush();
       }, controller.signal);
-      if (!terminal(job)) {
-        job.status = 'interrupted';
-        job.message = 'Stream ended without a final Amp result. Remote status is unknown; inspect the thread before retrying.';
-      }
-    } catch (error) {
-      // Preserve a final result already observed, even if stream cleanup later failed.
-      if (!terminal(job)) {
-        job.status = 'interrupted';
-        job.message = controller.signal.aborted ? 'HQ stopped monitoring (timeout, shutdown or explicit request). Remote work may still be running; inspect Amp before retrying.'
-          : error instanceof Error ? error.message : 'Amp observation failed. Remote status is unknown.';
-      }
+      if (!resultSeen) job.message = 'Stream ended without a final Amp result. Remote status is unknown; inspect Amp before retrying.';
+    } catch {
+      if (!resultSeen) job.message = 'HQ observation was interrupted (timeout, stop, shutdown or transport failure). Remote Amp work may continue; inspect Amp before retrying.';
     } finally {
-      clearTimeout(timer);
-      job.observedAt = new Date().toISOString();
-      job.finishedAt ??= job.observedAt;
-      this.store.put('amp_jobs', job.id, job);
+      clearInterval(heartbeat); clearTimeout(timeout);
+      await persistence;
+      try {
+        await this.store.transaction(async tx => {
+          const fresh = await tx.get<AmpJob>('amp_jobs', jobId);
+          if (!fresh || fresh.lease !== lease || terminal(fresh)) return;
+          await this.finish(tx, { ...job, stopRequested: fresh.stopRequested }, resultSeen ? job.status as 'succeeded' | 'failed' : 'interrupted', job.message);
+        });
+      } finally { this.workers.delete(jobId); }
     }
   }
-  getJob(input: z.input<typeof ampSchemas.job>) {
-    const { jobId } = ampSchemas.job.parse(input);
-    const job = this.store.get<AmpJob>('amp_jobs', jobId);
-    if (!job) throw new Error('Job not found. Use amp_jobs_get to find the exact job ID.');
-    return { ...job, observation: 'Persisted HQ observation, not a fresh query to Amp. Running means an in-flight SDK request is being observed; use live status for remote activity evidence. Succeeded means the requested Amp turn returned a successful result; inspect its text and permission denials for task completion.' };
+  private async finish(tx: Transaction, job: AmpJob, status: 'succeeded' | 'failed' | 'interrupted', message?: string) {
+    const usage = await tx.get<Usage>('amp_usage', job.usageDay);
+    const lock = await tx.get<WorkerLock>('amp_control', 'worker');
+    const target = job.threadId ? await tx.get<ThreadTarget>('amp_remote_threads', job.threadId) : undefined;
+    const actual = job.startedAt ? Math.min(job.reservedSeconds, Math.ceil((Date.now() - Date.parse(job.startedAt)) / 1000)) : 0;
+    if (usage) tx.put('amp_usage', job.usageDay, { ...usage, seconds: Math.max(0, usage.seconds - job.reservedSeconds + actual) });
+    if (lock?.jobId === job.id && lock.lease === job.lease) tx.delete('amp_control', 'worker');
+    if (job.threadId && (target?.activeJobId === job.id || !job.requestedThreadId)) {
+      tx.put('amp_remote_threads', job.threadId, { executor: job.executor, runnerId: job.runnerId, runnerDir: job.runnerDir, project: job.project } satisfies ThreadTarget);
+    }
+    tx.put('amp_jobs', job.id, { ...job, status, message, observedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), leaseUntil: undefined });
   }
-  getJobs(input: z.input<typeof ampSchemas.jobs> = {}) {
+  async getJob(input: z.input<typeof ampSchemas.job>) {
+    const { jobId } = ampSchemas.job.parse(input);
+    const job = await this.store.get<AmpJob>('amp_jobs', jobId);
+    if (!job) throw new Error('Job not found. Use amp_jobs_get for the exact job ID.');
+    return { ...job, observation: 'Persisted observation, not a fresh Amp status query. Queued means saved for delivery; inspect dispatchState. Running means a worker claimed the request. Succeeded means the Amp turn returned success, not proof that every requested task was completed.' };
+  }
+  async getJobs(input: z.input<typeof ampSchemas.jobs> = {}) {
     const { limit, offset } = ampSchemas.jobs.parse(input);
-    const jobs = this.store.all<AmpJob>('amp_jobs').sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
-    return { observation: 'Persisted HQ job states, not live Amp status. Running means an in-flight SDK request is being observed.', total: jobs.length, jobs: jobs.slice(offset, offset + limit).map(({ prompt: _prompt, latestText, events: _events, ...job }) => ({ ...job, latestText: latestText?.slice(-1500) })), nextOffset: offset + limit < jobs.length ? offset + limit : null };
+    const jobs = await this.store.find<AmpJob>('amp_jobs', { order: ['createdAt', 'desc'], offset, limit: limit + 1 });
+    return { jobs: jobs.slice(0, limit).map(({ prompt: _prompt, latestText, events: _events, lease: _lease, ...job }) => ({ ...job, latestText: latestText?.slice(-1500) })),
+      nextOffset: jobs.length > limit ? offset + limit : null, observation: 'Saved HQ observations; request live status for current remote activity.' };
   }
   async stopMonitor(input: z.input<typeof ampSchemas.job>) {
     const { jobId } = ampSchemas.job.parse(input);
-    this.getJob({ jobId });
-    const active = this.active.get(jobId);
-    active?.controller.abort();
-    await active?.promise;
+    await this.store.transaction(async tx => {
+      const job = await tx.get<AmpJob>('amp_jobs', jobId);
+      if (!job) throw new Error('Job not found.');
+      if (terminal(job)) return;
+      if (job.status === 'queued') await this.finish(tx, job, 'interrupted', 'Cancelled before the worker claimed it.');
+      else tx.put('amp_jobs', jobId, { ...job, stopRequested: true, message: 'Stop requested. The worker checks within 10 seconds; remote Amp execution may continue.' });
+    });
+    this.workers.get(jobId)?.abort();
     return this.getJob({ jobId });
+  }
+  async maintain() {
+    const queued = await this.store.find<AmpJob>('amp_jobs', { where: [['status', '==', 'queued']], limit: 20 });
+    for (const job of queued) {
+      if (Date.parse(job.createdAt) < Date.now() - 23 * 3_600_000) await this.stopMonitor({ jobId: job.id });
+      else await this.schedule(job.id);
+    }
+    const running = await this.store.find<AmpJob>('amp_jobs', { where: [['status', '==', 'running']], limit: 20 });
+    for (const job of running) {
+      if ((job.leaseUntil ?? 0) > Date.now()) continue;
+      await this.store.transaction(async tx => {
+        const fresh = await tx.get<AmpJob>('amp_jobs', job.id);
+        if (fresh?.status === 'running' && (fresh.leaseUntil ?? 0) <= Date.now()) {
+          await this.finish(tx, fresh, 'interrupted', 'Worker lease expired. Remote work may still be running; inspect Amp before retrying.');
+        }
+      });
+    }
+    for (const ns of ['oauth_pending', 'oauth_codes', 'oauth_access', 'oauth_refresh', 'oauth_families', 'receipts', 'amp_usage']) await this.store.pruneExpired(ns);
+    // Do not delete active jobs; terminal history is retained for 30 days.
+    const expired = await this.store.entries('amp_jobs', { where: [['expiresAt', '<=', Date.now()]], limit: 50 });
+    for (const row of expired) if (terminal(row.value as AmpJob)) await this.store.delete('amp_jobs', row.id);
+    return { recovered: queued.length, checked: running.length };
   }
   private async request(request: WorkerRequest) {
     this.enabled();
@@ -226,18 +318,17 @@ export class AmpService {
   async close() {
     this.closing = true;
     for (const controller of this.retrievals) controller.abort();
-    for (const active of this.active.values()) active.controller.abort();
-    await Promise.all([...this.active.values()].map(active => active.promise));
+    for (const controller of this.workers.values()) controller.abort();
   }
   tools(): ExtraTool[] {
     return [
       { name: 'amp_threads_get', description: 'Fetch fresh thread metadata from your Amp account using the official CLI, with offset pagination. This is not a running/completed status report.', schema: ampSchemas.list, scope: 'amp:read', openWorld: true, run: input => this.listThreads(input) },
       { name: 'amp_thread_read', description: 'Read the latest bounded excerpt of an Amp conversation by exact T-... ID. Use olderCursor plus revision to read older text without mixing revisions.', schema: ampSchemas.read, scope: 'amp:read', openWorld: true, run: input => this.readThread(input) },
       { name: 'amp_live_status', description: 'Fetch one fresh Amp active-thread snapshot. Upstream schema is experimental. If unavailable, status is unknown; never infer completion from absence.', schema: ampSchemas.live, scope: 'amp:read', openWorld: true, run: () => this.liveStatus() },
-      { name: 'amp_work_start', description: 'For an explicit user request, start or continue coding work in the configured Amp cloud sandbox or work runner. Spends Amp credits and can modify code. Returns immediately with a persisted job ID. Requires a unique idempotencyKey; reuse it only for an identical retry. Only remote threads originally created by HQ can be continued; existing account threads remain readable and monitorable.', schema: ampSchemas.start, scope: 'amp:execute', write: true, destructive: true, openWorld: true, run: input => this.start(input) },
+      { name: 'amp_work_start', description: 'For an explicit user request, start or continue coding work in the configured Amp cloud sandbox or work runner. Spends Amp credits and can modify code. Saves and schedules a durable task, then returns its job ID. Daily job/time limits apply. Requires a unique idempotencyKey; reuse it only for an identical retry. Only remote threads originally created by HQ can be continued; existing account threads remain readable and monitorable.', schema: ampSchemas.start, scope: 'amp:execute', write: true, destructive: true, openWorld: true, run: input => this.start(input) },
       { name: 'amp_jobs_get', description: 'Read compact persisted observations of jobs dispatched by HQ. Does not query Amp live. Follow nextOffset for older jobs.', schema: ampSchemas.jobs, scope: 'amp:read', run: input => this.getJobs(input) },
       { name: 'amp_job_get', description: 'Read a job’s latest observed assistant text, result, tool names and timestamps. Does not query Amp live.', schema: ampSchemas.job, scope: 'amp:read', run: input => this.getJob(input) },
-      { name: 'amp_monitor_stop', description: 'Stop HQ from observing a job. This DOES NOT guarantee that remote Amp execution stops. Tell the user remote work may continue, and inspect or stop it in Amp.', schema: ampSchemas.job, scope: 'amp:execute', write: true, run: input => this.stopMonitor(input) },
+      { name: 'amp_monitor_stop', description: 'Request that the worker stop observing a job, or cancel a still-queued request. This DOES NOT guarantee that remote Amp execution stops. Tell the user remote work may continue, and inspect or stop it in Amp.', schema: ampSchemas.job, scope: 'amp:execute', write: true, run: input => this.stopMonitor(input) },
     ];
   }
 }

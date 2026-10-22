@@ -13,13 +13,13 @@ export const testEnv = {
 };
 export async function fixture(store = new Store(':memory:')) {
   const config = loadConfig(testEnv);
-  const { app, oauth, domain } = createApp(config, store);
+  const { app, oauth, domain } = await createApp(config, store);
   const http = app.listen(0, '127.0.0.1');
   await once(http, 'listening');
   const port = (http.address() as { port: number }).port;
   const base = `http://127.0.0.1:${port}`;
   const request = (path: string, init?: RequestInit) => fetch(base + path, { ...init, redirect: 'manual' });
-  const close = async () => { http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve())); store.close(); };
+  const close = async () => { http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve())); await store.close(); };
   return { store, config, oauth, domain, request, base, close };
 }
 export type Fixture = Awaited<ReturnType<typeof fixture>>;

@@ -43,7 +43,7 @@ test('registration rejects unapproved callbacks; PKCE, client and redirect bindi
     assert.equal(response.status, 200);
     const tokens = await response.json() as any;
     assert.equal((await token(f, client, auth.code, auth.verifier)).status, 400);
-    const stored = JSON.stringify(f.store.db.prepare('SELECT * FROM documents').all());
+    const stored = JSON.stringify(await Promise.all(['oauth_clients', 'oauth_codes', 'oauth_access', 'oauth_refresh', 'oauth_families'].map(ns => f.store.all(ns))));
     for (const secret of [tokens.access_token, tokens.refresh_token, auth.code, client.client_secret]) assert(!stored.includes(secret));
     const reloaded = new OAuthProvider(f.store, f.config);
     assert.equal((await reloaded.verifyAccessToken(tokens.access_token)).clientId, client.client_id);
@@ -97,9 +97,9 @@ test('read-only scope cannot invoke writes, and token expiry is enforced', async
     assert(!names.includes('items_add'));
     const denied = await client.callTool({ name: 'items_add', arguments: { items: [{ title: 'Denied write' }] } });
     assert.equal(denied.isError, true);
-    assert.equal(f.domain.getItems().total, 0);
-    const grant = f.store.get<any>('oauth_access', digest(tokens.access_token));
-    f.store.put('oauth_access', digest(tokens.access_token), { ...grant, expiresAt: Date.now() - 1 });
+    assert.equal((await f.domain.getItems()).total, 0);
+    const grant = await f.store.get<any>('oauth_access', digest(tokens.access_token));
+    await f.store.put('oauth_access', digest(tokens.access_token), { ...grant, expiresAt: Date.now() - 1 });
     assert.equal((await f.request('/mcp', { method: 'POST', headers: { Authorization: `Bearer ${tokens.access_token}` } })).status, 401);
   } finally { await client.close(); await f.close(); }
 });
@@ -153,28 +153,24 @@ test('consent refuses wrong passwords and missing browser binding, and permits t
     const post = (tokenValue: string, passwordValue: string) => f.request('/oauth/consent', { method: 'POST', headers: { cookie, 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ request: pending, csrf: tokenValue, password: passwordValue, decision: 'allow' }) });
     assert.equal((await post('é'.repeat(43), 'wrong')).status, 403);
     assert.equal((await post(csrf, 'wrong password')).status, 401);
-    assert.equal(f.store.all('oauth_codes').length, 0);
-    assert.equal(f.store.all('oauth_access').length, 0);
+    assert.equal((await f.store.all('oauth_codes')).length, 0);
+    assert.equal((await f.store.all('oauth_access')).length, 0);
   } finally { await f.close(); }
 });
 
-test('OAuth grants and encrypted registered clients survive an actual database/server restart', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { Store } = await import('../src/store.js');
-  const directory = mkdtempSync(join(tmpdir(), 'hq-oauth-restart-'));
-  const path = join(directory, 'hq.db');
-  let f = await fixture(new Store(path));
+test('OAuth grants survive new server instances using the shared database', async () => {
+  const { Store, MemoryDriver } = await import('../src/store.js');
+  const driver = new MemoryDriver();
+  let f = await fixture(new Store(driver));
   try {
     const { client, tokens } = await connect(f);
-    f.domain.addItems({ items: [{ title: 'Persist across restart' }] });
+    await f.domain.addItems({ items: [{ title: 'Persist across restart' }] });
     await f.close();
-    f = await fixture(new Store(path));
+    f = await fixture(new Store(driver));
     assert.equal((await f.oauth.verifyAccessToken(tokens.access_token)).clientId, client.client_id);
     assert.equal((await f.oauth.clientsStore.getClient(client.client_id))?.client_id, client.client_id);
-    assert.equal(f.domain.getItems().items[0]?.title, 'Persist across restart');
+    assert.equal((await f.domain.getItems()).items[0]?.title, 'Persist across restart');
     const refreshed = await f.oauth.exchangeRefreshToken((await f.oauth.clientsStore.getClient(client.client_id))!, tokens.refresh_token);
     assert(refreshed.access_token);
-  } finally { await f.close(); rmSync(directory, { recursive: true }); }
+  } finally { await f.close(); }
 });

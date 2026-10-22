@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
-import { Store } from './store.js';
+import { Store, type Reader } from './store.js';
 
 const text = (max: number) => z.string().trim().min(1).max(max);
 const key = z.string().min(8).max(160).optional();
@@ -8,7 +8,7 @@ const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
   const parsed = new Date(`${value}T00:00:00Z`);
   return !Number.isNaN(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
 }, 'Use a valid calendar date in YYYY-MM-DD format.');
-const pagination = { limit: z.number().int().min(1).max(50).default(20), cursor: z.string().regex(/^\d{1,8}$/).optional() };
+const pagination = { limit: z.number().int().min(1).max(50).default(20), cursor: z.string().min(1).max(300).optional() };
 export const schemas = {
   list_create: z.object({ name: text(80), description: z.string().trim().max(400).default(''), idempotencyKey: key }),
   lists_get: z.object({ includeArchived: z.boolean().default(false) }),
@@ -28,85 +28,108 @@ export const schemas = {
 };
 
 type Input<K extends keyof typeof schemas> = z.input<(typeof schemas)[K]>;
-export interface List { id: string; name: string; description: string; archived: boolean; builtIn: boolean; createdAt: string }
-export interface Item { id: string; listId: string; title: string; status: 'open' | 'done'; priority: 'low' | 'normal' | 'high'; dueDate?: string | null; quantity?: string | null; notes: string; createdAt: string; updatedAt: string; completedAt?: string }
+export interface List { id: string; name: string; description: string; archived: boolean; builtIn: boolean; createdAt: string; openItems: number; doneItems: number }
+export interface Item { id: string; listId: string; title: string; status: 'open' | 'done'; priority: 'low' | 'normal' | 'high'; dueDate?: string | null; quantity?: string | null; notes: string; createdAt: string; updatedAt: string; completedAt?: string; sortKey: string }
 const normalize = (value: string) => value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase();
 const id = (prefix: string) => `${prefix}_${randomUUID()}`;
-function page<T>(values: T[], limit: number, cursor?: string) {
-  const offset = Number(cursor || 0);
-  return { total: values.length, items: values.slice(offset, offset + limit), nextCursor: offset + limit < values.length ? String(offset + limit) : null };
-}
+const sortKey = (item: Pick<Item, 'priority' | 'dueDate' | 'createdAt' | 'id'>) =>
+  `${{ high: 0, normal: 1, low: 2 }[item.priority]}|${item.dueDate ?? '9999-12-31'}|${item.createdAt}|${item.id}`;
 
 export class Domain {
-  constructor(readonly store: Store, private now = () => new Date()) {
-    for (const [listId, name] of [['todo', 'TODO'], ['shopping', 'Shopping']] as const) {
-      if (!store.get('lists', listId)) store.put('lists', listId, {
-        id: listId, name, description: '', archived: false, builtIn: true, createdAt: this.now().toISOString(),
-      } satisfies List);
-    }
+  constructor(readonly store: Store, private now = () => new Date()) {}
+  async initialize() {
+    await this.store.transaction(async tx => {
+      for (const [listId, name] of [['todo', 'TODO'], ['shopping', 'Shopping']] as const) {
+        if (!await tx.get('lists', listId)) {
+          tx.put('lists', listId, { id: listId, name, description: '', archived: false, builtIn: true,
+            createdAt: this.now().toISOString(), openItems: 0, doneItems: 0 } satisfies List);
+          tx.put('list_names', normalize(name), { listId });
+        }
+      }
+    });
   }
-  private list(reference: string): List {
-    const list = this.store.get<List>('lists', reference)
-      ?? this.store.all<List>('lists').find(value => normalize(value.name) === normalize(reference));
+  private async list(reference: string, reader: Reader = this.store): Promise<List> {
+    let list = await reader.get<List>('lists', reference);
+    if (!list) {
+      const index = await reader.get<{ listId: string }>('list_names', normalize(reference));
+      if (index) list = await reader.get<List>('lists', index.listId);
+    }
     if (!list) throw new Error('List not found. Use lists_get to find its name or ID.');
     return list;
   }
-  createList(input: Input<'list_create'>) {
+  async createList(input: Input<'list_create'>) {
     const value = schemas.list_create.parse(input);
-    return this.store.write('list_create', value.idempotencyKey, value, () => {
-      if (this.store.all<List>('lists').some(list => normalize(list.name) === normalize(value.name))) throw new Error('A list with that name already exists.');
-      const list: List = { id: id('list'), name: value.name, description: value.description, archived: false, builtIn: false, createdAt: this.now().toISOString() };
-      this.store.put('lists', list.id, list);
+    return this.store.write('list_create', value.idempotencyKey, value, async tx => {
+      if (await tx.get('list_names', normalize(value.name))) throw new Error('A list with that name already exists.');
+      const list: List = { id: id('list'), name: value.name, description: value.description, archived: false, builtIn: false, openItems: 0, doneItems: 0, createdAt: this.now().toISOString() };
+      tx.put('lists', list.id, list);
+      tx.put('list_names', normalize(list.name), { listId: list.id });
       return list;
     });
   }
-  getLists(input: Input<'lists_get'> = {}) {
+  async getLists(input: Input<'lists_get'> = {}) {
     const { includeArchived } = schemas.lists_get.parse(input);
-    const items = this.store.all<Item>('items');
-    return this.store.all<List>('lists').filter(list => includeArchived || !list.archived)
-      .map(list => ({ ...list, openItems: items.filter(item => item.listId === list.id && item.status === 'open').length }));
+    return (await this.store.all<List>('lists')).filter(list => includeArchived || !list.archived);
   }
-  archiveList(input: Input<'list_archive'>) {
+  async archiveList(input: Input<'list_archive'>) {
     const value = schemas.list_archive.parse(input);
-    return this.store.write('list_archive', value.idempotencyKey, value, () => {
-      const list = this.list(value.list);
+    return this.store.write('list_archive', value.idempotencyKey, value, async tx => {
+      const list = await this.list(value.list, tx);
       if (list.builtIn && value.archived) throw new Error('The TODO and Shopping lists are always available.');
       list.archived = value.archived;
-      this.store.put('lists', list.id, list);
+      tx.put('lists', list.id, list);
       return list;
     });
   }
-  addItems(input: Input<'items_add'>) {
+  async addItems(input: Input<'items_add'>) {
     const value = schemas.items_add.parse(input);
-    return this.store.write('items_add', value.idempotencyKey, value, () => {
-      const list = this.list(value.list);
+    return this.store.write('items_add', value.idempotencyKey, value, async tx => {
+      const list = await this.list(value.list, tx);
       if (list.archived) throw new Error('Restore the list before adding items.');
+      list.openItems += value.items.length;
+      tx.put('lists', list.id, list);
       return value.items.map(entry => {
         const now = this.now().toISOString();
-        const item: Item = { ...entry, id: id('item'), listId: list.id, status: 'open', createdAt: now, updatedAt: now };
-        this.store.put('items', item.id, item);
+        const fields = { ...entry, id: id('item'), listId: list.id, createdAt: now };
+        const item: Item = { ...fields, status: 'open', updatedAt: now, sortKey: sortKey(fields) };
+        tx.put('items', item.id, item);
         return item;
       });
     });
   }
-  getItems(input: Input<'items_get'> = {}) {
+  async getItems(input: Input<'items_get'> = {}) {
     const value = schemas.items_get.parse(input);
-    const list = this.list(value.list);
-    const priority = { high: 0, normal: 1, low: 2 };
-    const items = this.store.all<Item>('items').filter(item => item.listId === list.id && (value.status === 'all' || item.status === value.status))
-      .sort((a, b) => priority[a.priority] - priority[b.priority] || (a.dueDate ?? '9999').localeCompare(b.dueDate ?? '9999') || a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
-    return { list, ...page(items, value.limit, value.cursor) };
+    const list = await this.list(value.list);
+    let after: string | undefined;
+    if (value.cursor) {
+      after = Buffer.from(value.cursor, 'base64url').toString('utf8');
+      if (!/^[012]\|\d{4}-\d{2}-\d{2}\|[^|]+\|item_[a-f0-9-]+$/.test(after)) throw new Error('Invalid list cursor.');
+    }
+    const where: import('./store.js').Query['where'] = [['listId', '==', list.id]];
+    if (value.status !== 'all') where.push(['status', '==', value.status]);
+    const items = await this.store.find<Item>('items', { where, order: ['sortKey', 'asc'], after, limit: value.limit + 1 });
+    const hasMore = items.length > value.limit;
+    const visible = items.slice(0, value.limit);
+    return { list, total: value.status === 'open' ? list.openItems : value.status === 'done' ? list.doneItems : list.openItems + list.doneItems,
+      items: visible, nextCursor: hasMore ? Buffer.from(visible.at(-1)!.sortKey).toString('base64url') : null };
   }
-  updateItem(input: Input<'item_update'>) {
+  async updateItem(input: Input<'item_update'>) {
     const value = schemas.item_update.parse(input);
-    return this.store.write('item_update', value.idempotencyKey, value, () => {
-      const item = this.store.get<Item>('items', value.itemId);
+    return this.store.write('item_update', value.idempotencyKey, value, async tx => {
+      const item = await tx.get<Item>('items', value.itemId);
       if (!item) throw new Error('Item not found. Read the list first to get the exact item ID.');
+      const list = await this.list(item.listId, tx);
+      if (value.status && value.status !== item.status) {
+        list.openItems += value.status === 'open' ? 1 : -1;
+        list.doneItems += value.status === 'done' ? 1 : -1;
+        tx.put('lists', list.id, list);
+      }
       const { itemId: _id, idempotencyKey: _key, ...updates } = value;
       Object.assign(item, updates, { updatedAt: this.now().toISOString() });
       if (value.status === 'done') item.completedAt ??= this.now().toISOString();
       if (value.status === 'open') delete item.completedAt;
-      this.store.put('items', item.id, item);
+      item.sortKey = sortKey(item);
+      tx.put('items', item.id, item);
       return item;
     });
   }

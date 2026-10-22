@@ -11,11 +11,14 @@ import { Domain } from './domain.js';
 import { OAuthProvider, SCOPES } from './oauth.js';
 import { createMcpServer, type ExtraTool } from './mcp.js';
 import { homePage } from './pages.js';
+import { AmpService, TaskBusyError } from './amp.js';
+import type { InternalVerifier } from './tasks.js';
 
-export function createApp(config: Config, store: Store, extraTools: ExtraTool[] = []) {
+export async function createApp(config: Config, store: Store, extraTools: ExtraTool[] = [], internal?: { amp: AmpService; verify: InternalVerifier }) {
   const app = express();
   const oauth = new OAuthProvider(store, config);
   const domain = new Domain(store);
+  await domain.initialize();
   app.disable('x-powered-by');
   const callbackOrigins = [...new Set(config.redirectUris.map(uri => new URL(uri).origin))].join(' ');
   app.use(hostHeaderValidation([config.publicUrl.hostname, '127.0.0.1', 'localhost']));
@@ -30,6 +33,25 @@ export function createApp(config: Config, store: Store, extraTools: ExtraTool[] 
   app.use(express.urlencoded({ extended: false, limit: '8kb' }));
   app.get('/', (_req, res) => res.type('html').send(homePage()));
   app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
+  if (internal) {
+    app.use('/internal', async (req, res, next) => {
+      const header = req.headers.authorization;
+      if (!header?.startsWith('Bearer ') || !await internal.verify(header.slice(7))) {
+        res.status(401).json({ error: 'A verified task service identity is required.' }); return;
+      }
+      next();
+    });
+    app.post('/internal/amp/run', async (req, res) => {
+      const value = z.object({ jobId: z.string().uuid() }).strict().safeParse(req.body);
+      if (!value.success) { res.status(400).json({ error: 'Invalid task payload.' }); return; }
+      try { await internal.amp.runQueued(value.data.jobId); res.status(204).end(); }
+      catch (error) {
+        if (error instanceof TaskBusyError) { res.status(503).json({ error: 'Worker busy; retry delivery.' }); return; }
+        throw error;
+      }
+    });
+    app.post('/internal/maintenance', async (_req, res) => res.json(await internal.amp.maintain()));
+  }
   app.use(mcpAuthRouter({ provider: oauth, issuerUrl: config.publicUrl, resourceServerUrl: oauth.resource, scopesSupported: SCOPES, resourceName: 'HQ personal tools' }));
   app.get('/oauth/consent', (req, res) => oauth.showConsent(req, res));
   app.post('/oauth/consent', rateLimit({ windowMs: 900_000, limit: 10, standardHeaders: 'draft-8', legacyHeaders: false }), (req, res) => oauth.submitConsent(req, res));
@@ -42,7 +64,7 @@ export function createApp(config: Config, store: Store, extraTools: ExtraTool[] 
   });
   app.post('/mcp', async (req, res) => {
     const server = createMcpServer(domain, req.auth!.scopes, [
-      { name: 'hq_status', description: 'Read HQ capabilities, owner time zone and server configuration status, without credentials.', schema: z.object({}), scope: 'hq:read', run: () => ({ version: '0.1.0', timeZone: config.timeZone, features: ['lists', 'amp'], amp: { enabled: config.ampEnabled, executor: config.ampExecutor, configured: !!config.ampApiKey }, voice: 'Voice tool availability depends on the connected client.' }) },
+      { name: 'hq_status', description: 'Read HQ capabilities, owner time zone and server configuration status, without credentials.', schema: z.object({}), scope: 'hq:read', run: () => ({ version: '0.1.0', timeZone: config.timeZone, features: ['lists', 'amp'], storage: config.storageBackend, jobs: config.jobBackend, amp: { enabled: config.ampEnabled, executor: config.ampExecutor, configured: !!config.ampApiKey }, voice: 'Voice tool availability depends on the connected client.' }) },
       ...extraTools,
     ]);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
